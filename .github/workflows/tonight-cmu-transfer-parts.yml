@@ -1,0 +1,65 @@
+name: TONIGHT CMU transfer parts
+on:
+  push:
+    branches: [tonight-public-source-collection-20260911]
+    paths: [.github/workflows/tonight-cmu-transfer-parts.yml]
+permissions:
+  actions: read
+concurrency:
+  group: tonight-cmu-transfer-parts
+  cancel-in-progress: true
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Read the completed public source artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tonight-public-cmu-archive
+          path: source/
+          run-id: 34561020424
+          github-token: ${{ github.token }}
+      - name: Create two bounded data parts with whole-file and part hashes
+        shell: python
+        run: |
+          import hashlib, json, pathlib
+          source = pathlib.Path('source/corenlp_plot_summaries.tar')
+          receipt = json.loads(pathlib.Path('source/receipt.json').read_text(encoding='utf-8'))
+          size = source.stat().st_size
+          if size != receipt['bytes'] or size > 900000000:
+              raise ValueError('Unexpected official source size')
+          part_size = (size + 1) // 2
+          whole = hashlib.sha256(); parts = []
+          with source.open('rb') as stream:
+              for number in [1, 2]:
+                  folder = pathlib.Path('part-' + str(number)); folder.mkdir()
+                  target = folder / ('corenlp.part' + str(number))
+                  h = hashlib.sha256(); written = 0
+                  with target.open('wb') as output:
+                      while written < part_size:
+                          block = stream.read(min(1048576, part_size - written))
+                          if not block:
+                              break
+                          written += len(block); output.write(block); h.update(block); whole.update(block)
+                  parts.append({'number': number, 'filename': target.name, 'bytes': written, 'sha256': h.hexdigest()})
+          if whole.hexdigest() != receipt['sha256']:
+              raise ValueError('Downloaded artifact does not match the official source receipt')
+          manifest = {'source_receipt': receipt, 'parts': parts, 'whole_sha256': whole.hexdigest(), 'whole_bytes': size}
+          for number in [1, 2]:
+              pathlib.Path('part-' + str(number) + '/transfer.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+          print('TONIGHT_TRANSFER_RESULT=' + json.dumps(manifest), flush=True)
+      - name: Retain first data part for one day
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tonight-cmu-part-1
+          path: part-1/
+          retention-days: 1
+          compression-level: 0
+      - name: Retain second data part for one day
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tonight-cmu-part-2
+          path: part-2/
+          retention-days: 1
+          compression-level: 0
