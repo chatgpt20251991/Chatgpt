@@ -1,0 +1,42 @@
+name: TONIGHT public source connectivity
+on:
+  push:
+    branches: [tonight-public-source-collection-20260911]
+    paths: [.github/workflows/tonight-source-probe.yml]
+permissions: {}
+concurrency:
+  group: tonight-public-source-probe
+  cancel-in-progress: true
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Read public source endpoints without credentials
+        shell: python
+        run: |
+          import hashlib, json, urllib.request, datetime
+          sources = [
+            ('tvmaze', 'https://api.tvmaze.com/shows?page=0'),
+            ('cmu', 'https://www.cs.cmu.edu/~ark/personas/data/README.txt'),
+            ('omdb', 'https://www.omdb.org/en/us/content/Help:DataDownload'),
+          ]
+          results = []
+          for name, url in sources:
+              try:
+                  request = urllib.request.Request(url, headers={'User-Agent': 'TONIGHT-public-source-connectivity-check/1.0'})
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      data = response.read(2000001)
+                      if len(data) > 2000000:
+                          raise ValueError('bounded response limit exceeded')
+                      record = {'source': name, 'url': url, 'status': response.status, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                      if name == 'tvmaze':
+                          parsed = json.loads(data)
+                          record['public_records'] = len(parsed)
+                          record['first_id'] = parsed[0]['id'] if parsed else None
+                  results.append(record)
+              except Exception as exc:
+                  results.append({'source': name, 'url': url, 'error_type': type(exc).__name__, 'error': str(exc)[:240]})
+          print('TONIGHT_PROBE_RESULT=' + json.dumps({'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'results': results, 'private_inputs': False, 'artifacts_created': False}))
+          if not any('status' in item for item in results):
+              raise SystemExit(1)
