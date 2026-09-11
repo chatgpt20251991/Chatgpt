@@ -1,0 +1,105 @@
+name: TONIGHT public Wikipedia source texts
+on:
+  push:
+    branches: [tonight-public-source-collection-20260911]
+    paths: [.github/workflows/tonight-public-wikipedia-revisions.yml]
+permissions: {}
+concurrency:
+  group: tonight-public-wikipedia-revisions
+  cancel-in-progress: true
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    steps:
+      - name: Read public film source links and public revisions only
+        shell: python
+        run: |
+          import bz2, csv, datetime, gzip, hashlib, io, json, pathlib, time, urllib.request, urllib.parse
+          out = pathlib.Path('public-wikipedia'); out.mkdir()
+          ua = 'TONIGHT-source-audit/1.0 (https://github.com/chatgpt20251991/Chatgpt)'
+          start = time.monotonic(); receipts = []; total = 0; completed = False; batches = 0
+          def get(url, bound):
+              if time.monotonic() - start > 1650:
+                  raise TimeoutError('Source collection wall-clock limit reached')
+              request = urllib.request.Request(url, headers={'User-Agent': ua, 'Accept-Encoding': 'gzip'})
+              with urllib.request.urlopen(request, timeout=35) as response:
+                  raw = response.read(bound + 1)
+                  if len(raw) > bound:
+                      raise ValueError('Bounded response exceeded')
+                  if response.headers.get('Content-Encoding') == 'gzip':
+                      with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                          raw = compressed.read(bound + 1)
+                      if len(raw) > bound:
+                          raise ValueError('Bounded decoded response exceeded')
+                  receipts.append({'url': url, 'status': response.status, 'bytes': len(raw), 'sha256_decoded_response': hashlib.sha256(raw).hexdigest(), 'retrieved_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()})
+                  return raw
+          def rows(name):
+              raw = get('https://www.omdb.org/data/' + name, 60000000)
+              with bz2.open(io.BytesIO(raw), 'rt', encoding='utf-8', newline='') as stream:
+                  for n, row in enumerate(csv.DictReader(stream)):
+                      if n > 2500000:
+                          raise ValueError('Public CSV row safety limit exceeded')
+                      yield row
+          try:
+              # One documented read verifies access before any bulk collection.
+              probe = json.loads(get('https://en.wikipedia.org/w/api.php?action=query&format=json&formatversion=2&titles=Memento_(film)&prop=info&maxlag=5', 2000000))
+              if 'error' in probe:
+                  raise ValueError('Wikipedia refused initial query: ' + str(probe['error']))
+              works = set()
+              for filename in ['all_movies.csv.bz2', 'all_series.csv.bz2']:
+                  works.update(row['id'] for row in rows(filename))
+              described = set()
+              for language in ['en', 'de', 'fr', 'es']:
+                  described.update(row['movie_id'] for row in rows('movie_abstracts_' + language + '.csv.bz2') if row.get('abstract', '').strip())
+              links = {}
+              for row in rows('movie_links.csv.bz2'):
+                  if row.get('movie_id') not in works or row.get('source') != 'wikipedia' or row.get('language_iso_639_1') != 'en':
+                      continue
+                  title = urllib.parse.unquote(row['key']).replace('_', ' ')
+                  if not title or len(title) > 500 or '|' in title:
+                      continue
+                  links.setdefault(title, []).append(row['movie_id'])
+              ordered = sorted(links, key=lambda title: (all(ident in described for ident in links[title]), title))
+              (out / 'public-omdb-wikipedia-links.json').write_text(json.dumps(links, ensure_ascii=False), encoding='utf-8')
+              with gzip.open(out / 'revision-responses.jsonl.gz', 'wt', encoding='utf-8', compresslevel=6) as stream:
+                  position = 0
+                  while position < len(ordered):
+                      if batches >= 1600:
+                          raise ValueError('Bounded batch limit reached')
+                      titles = []
+                      while position < len(ordered) and len(titles) < 50:
+                          candidate = ordered[position]
+                          if titles and len(urllib.parse.urlencode({'titles': '|'.join(titles + [candidate])})) > 5500:
+                              break
+                          titles.append(candidate); position += 1
+                      parameters = {'action': 'query', 'format': 'json', 'formatversion': '2', 'prop': 'revisions|pageprops', 'ppprop': 'wikibase_item|disambiguation', 'rvprop': 'ids|timestamp|content|sha1', 'rvslots': 'main', 'redirects': '1', 'titles': '|'.join(titles), 'maxlag': '5', 'maxage': '86400', 'smaxage': '86400'}
+                      url = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(parameters)
+                      response = json.loads(get(url, 16000000))
+                      if 'error' in response:
+                          raise ValueError('Wikipedia API error; collection stopped: ' + str(response['error']))
+                      if 'continue' in response:
+                          raise ValueError('Unexpected continuation; not counted as a complete batch')
+                      record = {'requested_titles': titles, 'receipt_index': len(receipts) - 1, 'response': response}
+                      stream.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+                      total += len(response.get('query', {}).get('pages', [])); batches += 1
+                      if batches % 20 == 0:
+                          print(json.dumps({'batches': batches, 'page_records': total, 'requested': position, 'public_titles': len(ordered)}), flush=True)
+                      time.sleep(0.7)
+                  completed = True
+          finally:
+              report = {'source': 'English Wikipedia revisions + public omdb link index', 'completed_public_link_round': completed, 'page_records': total, 'batches': batches, 'receipts': receipts, 'private_inputs': False, 'numeric_f_profiles_created': 0, 'license': 'Wikipedia text CC BY-SA 4.0; omdb link metadata attribution conditions retained', 'finished_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+              for file in out.iterdir():
+                  if file.is_file():
+                      report.setdefault('files', {})[file.name] = {'sha256': hashlib.sha256(file.read_bytes()).hexdigest(), 'bytes': file.stat().st_size}
+              (out / 'receipt.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('TONIGHT_WIKIPEDIA_RESULT=' + json.dumps({k:v for k,v in report.items() if k != 'receipts'}), flush=True)
+      - name: Retain source receipts and licensed texts for one day
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tonight-public-wikipedia-revisions
+          path: public-wikipedia/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
